@@ -1,0 +1,40 @@
+name: C114 synthetic dispatch launcher
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: none
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send one repository dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          url = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/dispatches"
+          marker = "C114-20261004-" + os.environ["GITHUB_RUN_ID"]
+          body = json.dumps({"event_type": "c114-policy-probe", "client_payload": {"marker": marker}}).encode()
+          request = urllib.request.Request(
+              url,
+              data=body,
+              method="POST",
+              headers={
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2026-03-10",
+              },
+          )
+          with urllib.request.urlopen(request, timeout=10) as response:
+              print("dispatch_status=" + str(response.status))
+          print("marker=" + marker)
+          PY
