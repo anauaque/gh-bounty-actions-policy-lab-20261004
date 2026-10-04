@@ -1,0 +1,20 @@
+name: C114 dispatch delivery control
+
+on:
+  repository_dispatch:
+    types: [c114-policy-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  decoy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record non-sensitive delivery identity
+        env:
+          MARKER: ${{ github.event.client_payload.marker }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          printf 'marker=%s\nactor=%s\ntriggering_actor=%s\n' "$MARKER" "$ACTOR" "$TRIGGERING_ACTOR"
