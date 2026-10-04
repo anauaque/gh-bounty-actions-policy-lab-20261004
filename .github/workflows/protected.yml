@@ -1,0 +1,40 @@
+name: C114 actor policy protected control
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [c114-policy-probe]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  protected:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record protected job identity
+        env:
+          MARKER: ${{ github.event.client_payload.marker }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: |
+          printf 'marker=%s\nactor=%s\ntriggering_actor=%s\n' "$MARKER" "$ACTOR" "$TRIGGERING_ACTOR"
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.request
+
+          endpoint = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
+          separator = "&" if "?" in endpoint else "?"
+          request = urllib.request.Request(
+              endpoint + separator + "audience=c114-synthetic-lab",
+              headers={"Authorization": "Bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]},
+          )
+          with urllib.request.urlopen(request, timeout=10) as response:
+              token = json.load(response)["value"]
+          payload = token.split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+          print(json.dumps({key: claims.get(key) for key in ("repository", "workflow_ref", "actor", "sub")}, sort_keys=True))
+          PY
