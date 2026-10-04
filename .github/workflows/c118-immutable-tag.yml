@@ -1,0 +1,248 @@
+name: C118 immutable release tag boundary
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: setup or test
+        required: true
+        type: choice
+        options:
+          - setup
+          - test
+      original_sha:
+        description: 40-character commit with this workflow
+        required: true
+        type: string
+      alternate_sha:
+        description: README-only descendant commit
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: c118-immutable-tag-boundary
+  cancel-in-progress: false
+
+jobs:
+  bounded_probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check one own repository and stop on first conclusive result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          C118_PHASE: ${{ inputs.phase }}
+          C118_ORIGINAL: ${{ inputs.original_sha }}
+          C118_ALTERNATE: ${{ inputs.alternate_sha }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          REPO = "anauaque/gh-bounty-actions-policy-lab-20261004"
+          TAG = "c118-immutable-20261004-f9a331a2"
+          CONTROL = "c118-control-20261004-f9a331a2"
+          WORKFLOW = ".github/workflows/c118-immutable-tag.yml"
+          API = "https://api.github.com/repos/" + REPO + "/"
+          TOKEN = os.environ["GH_TOKEN"]
+          PHASE = os.environ["C118_PHASE"]
+          S0 = os.environ["C118_ORIGINAL"].lower()
+          S1 = os.environ["C118_ALTERNATE"].lower()
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          OPENER = urllib.request.build_opener(NoRedirect())
+
+          def report(outcome, **details):
+              print("C118_RESULT " + json.dumps({"outcome": outcome, **details}, sort_keys=True))
+              sys.exit(0 if outcome == "fixture_ready" or outcome.startswith(("negative_", "candidate_")) else 2)
+
+          def request(method, path, body=None, authenticated=True):
+              headers = {
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2026-03-10",
+                  "User-Agent": "c118-own-repo-boundary-check",
+              }
+              if authenticated:
+                  headers["Authorization"] = "Bearer " + TOKEN
+              data = None if body is None else json.dumps(body).encode("utf-8")
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(API + path, data=data, headers=headers, method=method)
+              try:
+                  with OPENER.open(req, timeout=15) as response:
+                      status, raw = response.status, response.read(32768)
+              except urllib.error.HTTPError as error:
+                  status, raw = error.code, error.read(4096)
+              try:
+                  value = json.loads(raw)
+              except (ValueError, TypeError):
+                  value = {}
+              return status, value
+
+          def ref(name, authenticated=True):
+              status, value = request("GET", "git/ref/tags/" + name, authenticated=authenticated)
+              obj = value.get("object", {}) if isinstance(value, dict) else {}
+              return status, obj.get("type"), obj.get("sha")
+
+          def release():
+              status, value = request("GET", "releases/tags/" + TAG)
+              return status, value
+
+          if os.environ.get("GITHUB_REPOSITORY") != REPO:
+              report("invalid_repository")
+          if os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch":
+              report("invalid_event")
+          if PHASE not in ("setup", "test"):
+              report("invalid_phase")
+          if not re.fullmatch(r"[0-9a-f]{40}", S0) or not re.fullmatch(r"[0-9a-f]{40}", S1) or S0 == S1:
+              report("invalid_commits")
+          if os.environ.get("GITHUB_REF") != "refs/heads/main" or os.environ.get("GITHUB_SHA", "").lower() != S1:
+              report("workflow_not_on_expected_main")
+          status, head = request("GET", "git/ref/heads/main")
+          if status != 200 or head.get("object", {}).get("sha") != S1:
+              report("main_not_at_alternate", status=status)
+          status, comparison = request("GET", "compare/" + S0 + "..." + S1)
+          changed = [item.get("filename") for item in comparison.get("files", [])] if isinstance(comparison, dict) else []
+          if (status != 200 or comparison.get("status") != "ahead"
+                  or comparison.get("ahead_by") != 1 or comparison.get("behind_by") != 0
+                  or changed != ["README.md"]):
+              report("unexpected_commit_difference", status=status, changed=changed)
+          status0, file0 = request("GET", "contents/" + WORKFLOW + "?ref=" + S0)
+          status1, file1 = request("GET", "contents/" + WORKFLOW + "?ref=" + S1)
+          if status0 != 200 or status1 != 200 or file0.get("sha") != file1.get("sha"):
+              report("workflow_not_identical", status0=status0, status1=status1)
+
+          if PHASE == "setup":
+              if ref(CONTROL)[0] != 404 or ref(TAG)[0] != 404 or release()[0] != 404:
+                  report("fixture_already_exists")
+              status_c, _ = request("POST", "git/refs", {"ref": "refs/tags/" + CONTROL, "sha": S0})
+              if status_c != 201:
+                  report("control_tag_create_failed", status=status_c)
+              status_t, _ = request("POST", "git/refs", {"ref": "refs/tags/" + TAG, "sha": S0})
+              if status_t != 201:
+                  report("protected_tag_create_failed", status=status_t)
+              status_r, made = request("POST", "releases", {
+                  "tag_name": TAG,
+                  "target_commitish": S0,
+                  "name": "C118 synthetic immutable boundary",
+                  "body": "Synthetic security boundary test. No production assets.",
+                  "draft": False,
+                  "prerelease": True,
+              })
+              status_read, current = release()
+              control_ready = ref(CONTROL)
+              protected_ready = ref(TAG)
+              if (status_r != 201 or not isinstance(made.get("id"), int) or made.get("id") <= 0
+                      or status_read != 200 or current.get("id") != made.get("id")
+                      or not current.get("published_at") or current.get("immutable") is not True
+                      or current.get("draft") is not False or current.get("tag_name") != TAG
+                      or control_ready != (200, "commit", S0) or protected_ready != (200, "commit", S0)):
+                  report("immutable_fixture_failed", create_status=status_r, read_status=status_read,
+                         immutable=current.get("immutable"), draft=current.get("draft"),
+                         control_ref=control_ready, protected_ref=protected_ready)
+              report("fixture_ready", release_id=current.get("id"), original_sha=S0,
+                     control_sha=control_ready[2], protected_sha=protected_ready[2],
+                     immutable=current.get("immutable"), published=bool(current.get("published_at")))
+
+          status_r, before = release()
+          status_c, type_c, sha_c = ref(CONTROL)
+          status_t, type_t, sha_t = ref(TAG)
+          if (status_r != 200 or before.get("draft") is not False or before.get("immutable") is not True
+                  or not before.get("published_at") or before.get("tag_name") != TAG
+                  or status_c != 200 or status_t != 200 or type_c != "commit" or type_t != "commit"
+                  or sha_c != S0 or sha_t != S0):
+              report("invalid_test_preflight", release_status=status_r, immutable=before.get("immutable"),
+                     draft=before.get("draft"), control_sha=sha_c, protected_sha=sha_t)
+          release_id = before["id"]
+          status_control, _ = request("PATCH", "git/refs/tags/" + CONTROL, {"sha": S1, "force": True})
+          control_after = ref(CONTROL)
+          if status_control != 200 or control_after != (200, "commit", S1):
+              report("inconclusive_no_ref_permission", patch_status=status_control, control_after=control_after)
+          status_baseline, _ = request("PATCH", "git/refs/tags/" + TAG, {"sha": S1, "force": True})
+          baseline_after = ref(TAG)
+          if status_baseline == 200 and baseline_after == (200, "commit", S1):
+              direct_anonymous = ref(TAG, authenticated=False)
+              direct_status, direct_release = request("GET", "releases/" + str(release_id))
+              if (direct_anonymous != (200, "commit", S1) or direct_status != 200
+                      or direct_release.get("id") != release_id
+                      or direct_release.get("draft") is not False
+                      or direct_release.get("immutable") is not True
+                      or not direct_release.get("published_at")):
+                  report("inconclusive_direct_tag_move", patch_status=status_baseline,
+                         anonymous_ref=direct_anonymous, release_status=direct_status,
+                         release_id=direct_release.get("id"))
+              report("candidate_direct_tag_move", patch_status=status_baseline, release_id=release_id,
+                     anonymous_ref=direct_anonymous)
+          if status_baseline == 200 or baseline_after != (200, "commit", S0):
+              report("inconclusive_baseline", patch_status=status_baseline, ref_after=baseline_after)
+          if status_baseline not in (403, 422):
+              report("inconclusive_baseline_status", patch_status=status_baseline, ref_after=baseline_after)
+          edited_name = "C118 synthetic immutable boundary (PATCH permitted)"
+          status_edit, _ = request("PATCH", "releases/" + str(release_id), {"name": edited_name})
+          status_edit_read, edited_release = request("GET", "releases/" + str(release_id))
+          if (status_edit != 200 or status_edit_read != 200 or edited_release.get("id") != release_id
+                  or edited_release.get("name") != edited_name or edited_release.get("draft") is not False
+                  or edited_release.get("immutable") is not True):
+              report("inconclusive_release_edit_permission", patch_status=status_edit,
+                     read_status=status_edit_read, name=edited_release.get("name"))
+          status_draft, _ = request("PATCH", "releases/" + str(release_id), {"draft": True})
+          status_recheck, after_draft = request("GET", "releases/" + str(release_id))
+          if status_recheck != 200 or after_draft.get("id") != release_id:
+              report("inconclusive_release_readback", patch_status=status_draft, read_status=status_recheck)
+          ref_after_draft = ref(TAG)
+          if status_draft != 200 or after_draft.get("draft") is not True:
+              if (status_draft in (403, 422) and after_draft.get("draft") is False
+                      and ref_after_draft == (200, "commit", S0)):
+                  report("negative_draft_refused", patch_status=status_draft, draft=False,
+                         protected_sha=S0)
+              report("inconclusive_draft_response", patch_status=status_draft,
+                     draft=after_draft.get("draft"), ref_after=ref_after_draft)
+          if ref_after_draft != (200, "commit", S0):
+              report("unexpected_tag_state_on_draft", patch_status=status_draft,
+                     draft=True, ref_after=ref_after_draft, release_id=release_id)
+          status_second, _ = request("PATCH", "git/refs/tags/" + TAG, {"sha": S1, "force": True})
+          second_after = ref(TAG)
+          if status_second in (403, 422) and second_after == (200, "commit", S0):
+              report("negative_draft_still_locks_tag", patch_status=status_second,
+                     ref_after=second_after, release_id=release_id)
+          if status_second != 200 or second_after != (200, "commit", S1):
+              report("inconclusive_second_tag_update", patch_status=status_second,
+                     ref_after=second_after, release_id=release_id)
+          anonymous_ref = ref(TAG, authenticated=False)
+          if anonymous_ref != (200, "commit", S1):
+              report("inconclusive_anonymous_ref", patch_status=status_second,
+                     authenticated_ref=second_after, anonymous_ref=anonymous_ref)
+          status_republish, _ = request("PATCH", "releases/" + str(release_id), {"draft": False})
+          final_status, final_release = request("GET", "releases/" + str(release_id))
+          final_ref = ref(TAG, authenticated=False)
+          if (final_status != 200 or final_release.get("id") != release_id
+                  or final_release.get("tag_name") != TAG
+                  or final_ref != (200, "commit", S1)):
+              report("inconclusive_final_readback", republish_status=status_republish,
+                     release_status=final_status, release_id=final_release.get("id"),
+                     final_ref=final_ref)
+          if (status_republish == 200 and final_release.get("draft") is False
+                  and final_release.get("immutable") is True
+                  and final_release.get("published_at")):
+              final_outcome = "candidate_republished_same_id_tag"
+          elif final_release.get("draft") is True:
+              final_outcome = "candidate_tag_move_draft_only"
+          else:
+              report("inconclusive_final_release_state", republish_status=status_republish,
+                     draft=final_release.get("draft"), immutable=final_release.get("immutable"))
+          report(final_outcome, release_id=release_id,
+                 original_sha=S0, alternate_sha=S1, anonymous_ref=anonymous_ref,
+                 republish_status=status_republish, final_release_status=final_status,
+                 final_draft=final_release.get("draft"), final_immutable=final_release.get("immutable"),
+                 final_tag=final_release.get("tag_name"), final_ref=final_ref)
+          PY
