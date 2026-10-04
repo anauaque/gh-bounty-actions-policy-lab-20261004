@@ -1,0 +1,29 @@
+name: C120 environment branch gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: with-deployment or without-deployment
+        required: true
+        type: choice
+        options:
+          - without-deployment
+          - with-deployment
+
+permissions:
+  contents: read
+
+jobs:
+  branch_gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    environment:
+      name: c120-allow-main-20261004
+      deployment: ${{ inputs.mode == 'with-deployment' }}
+    steps:
+      - name: Record only that the environment-gated job started
+        env:
+          C120_MODE: ${{ inputs.mode }}
+        run: |
+          printf 'C120_JOB_STARTED ref=%s mode=%s run=%s\n' "$GITHUB_REF" "$C120_MODE" "$GITHUB_RUN_ID"
